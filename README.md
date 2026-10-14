@@ -139,6 +139,35 @@ The client reports tool stalls to `/v1/tokencake/events` so the temporal policy 
 
 Send `{"event":"stall_finished", "lifecycle_id":"..."}` when the tool returns. Offload requires the native CPU offload backend, a positive `--kv-offloading-size`, and `VLLM_USE_SIMPLE_KV_OFFLOAD=0`. The current implementation also requires `data_parallel_size=1`.
 
+### OpenHands with Qwen3.5-27B
+
+The [OpenHands launcher](tools/tokencake_experiments/openhands_qwen35.py) exposes
+`base`, `agent`, `offload`, and `agent_offload` modes with the same model settings.
+It enables native tool calling, text-only inference, and aligned Mamba prefix
+caching for Qwen3.5's hybrid architecture:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/python \
+  tools/tokencake_experiments/openhands_qwen35.py \
+  --model Qwen/Qwen3.5-27B --tensor-parallel-size 4 \
+  --port 18081 --mode agent_offload --kv-offloading-size 8 \
+  --max-model-len 131072 --max-num-seqs 4
+```
+
+Use `--dry-run` to inspect the launch plan without loading the model. The model
+may also be a local checkpoint path. Remove `--kv-offloading-size` for `base` or
+`agent`; keep GPU selection and common parameters identical across modes.
+Defaults use greedy generation with thinking disabled; these are development
+control settings, not a claim about optimal Qwen quality.
+
+In the companion OpenHands checkout, `benchmarks/flowpilot/TOKENCAKE.md` describes
+the native metadata/lifecycle adapter, existing benchmark configuration, and the
+`benchmark_adapters.tokencake_smoke` integration check. Point its LLM at
+`http://127.0.0.1:18081/v1`, with model `openai/Qwen3.5-27B`, and select the same
+mode. Disable FlowPilot optimizations for this control. Qwen3.5 results require
+their own validation: the Qwen2.5 measurements above do not establish hybrid
+model KV offload correctness or performance.
+
 ## Repository layout
 
 | Path | Purpose |

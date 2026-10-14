@@ -7,6 +7,7 @@ import torch
 
 from tests.tokencake.test_offloading import (
     complete_generation,
+    complete_mamba_generation,
     make_offload_scheduler,
     request_for,
     start,
@@ -40,6 +41,8 @@ def collect_output(worker):
         (1, 2, False),
         (2, 1, False),
         ("hybrid", 1, False),
+        ("mamba", 1, False),
+        ("mamba", 2, False),
         (1, 1, True),
         (1, 2, True),
         (2, 1, True),
@@ -51,7 +54,9 @@ def test_preserved_data_survives_source_overwrite_and_native_prefix_reload(
 ):
     monkeypatch.setenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0")
     scheduler = make_offload_scheduler(
-        gpu_blocks={1: 17, 2: 25, "hybrid": 33}[groups], groups=groups, factor=factor
+        gpu_blocks={1: 17, 2: 25, "hybrid": 33, "mamba": 21}[groups],
+        groups=groups,
+        factor=factor,
     )
     offload = scheduler.connector.tokencake_scheduler
     spec = CPUOffloadingSpec(scheduler.vllm_config, scheduler.kv_cache_config)
@@ -75,15 +80,21 @@ def test_preserved_data_survives_source_overwrite_and_native_prefix_reload(
     worker = OffloadingConnectorWorker(spec)
     worker._register_handlers(CanonicalKVCaches(tensors, refs))
     try:
-        original = request_for("creator", tokens=128)
-        record = complete_generation(scheduler, original)
+        original = request_for("creator", tokens=135 if groups == "mamba" else 128)
+        record = (
+            complete_mamba_generation(scheduler, original)
+            if groups == "mamba"
+            else complete_generation(scheduler, original)
+        )
         snapshot = record.snapshot
         assert snapshot is not None
         expected = {
-            (group_index, block_index): tensors[group_index].tensor[list(ids)].clone()
+            (group_index, block_index): tensors[group_index]
+            .tensor[[bid for bid in ids if bid]]
+            .clone()
             for group_index, group in enumerate(snapshot.groups)
             for block_index, ids in enumerate(group.block_ids)
-            if all(ids)
+            if any(ids)
         }
         if shared:
             peer = request_for("peer", tokens=144)
@@ -156,7 +167,8 @@ def test_preserved_data_survives_source_overwrite_and_native_prefix_reload(
                 if key not in record.retained or (group_index, index) not in expected:
                     continue
                 targets = allocated[group_index][index * factor : (index + 1) * factor]
-                if not targets or any(b.block_id == 0 for b in targets):
+                targets = [b for b in targets if b.block_id != 0]
+                if not targets:
                     continue
                 actual = tensors[group_index].tensor[[b.block_id for b in targets]]
                 torch.testing.assert_close(actual, expected[group_index, index])

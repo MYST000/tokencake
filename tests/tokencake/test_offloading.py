@@ -35,6 +35,7 @@ from vllm.v1.engine.core import EngineCore
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
+    MambaSpec,
     SlidingWindowSpec,
 )
 from vllm.v1.kv_offload.base import GPULoadStoreSpec
@@ -93,6 +94,23 @@ def make_offload_scheduler(
                 ),
             ],
         )
+    elif groups == "mamba":
+        spec = cache.kv_cache_groups[0].kv_cache_spec
+        cache = replace(
+            cache,
+            kv_cache_groups=[
+                cache.kv_cache_groups[0],
+                KVCacheGroupSpec(
+                    ["state"],
+                    MambaSpec(
+                        block_size=16,
+                        shapes=((2, 16),),
+                        dtypes=(spec.dtype,),
+                        mamba_cache_mode="align",
+                    ),
+                ),
+            ],
+        )
     cache = replace(
         cache,
         kv_cache_tensors=[
@@ -109,6 +127,7 @@ def make_offload_scheduler(
         cache_config=replace(
             base.cache_config,
             kv_offloading_size=cpu_blocks * bytes_per_block / 2**30,
+            mamba_cache_mode="align" if groups == "mamba" else "none",
         ),
         kv_transfer_config=KVTransferConfig(
             kv_connector="OffloadingConnector",
@@ -172,6 +191,19 @@ def complete_generation(scheduler, request):
     offload = scheduler.connector.tokencake_scheduler
     identifier = request.sampling_params.extra_args["tokencake"]["lifecycle_id"]
     return offload.lifecycles.records[identifier]
+
+
+def complete_mamba_generation(scheduler, request):
+    """Finish between state boundaries after recycling the aligned state slot."""
+    scheduler.add_request(request)
+    for _ in range(32):
+        if request.num_output_tokens >= 3:
+            break
+        decode(scheduler, scheduler.schedule(), partial_prefills=True)
+    assert request.num_output_tokens >= 3
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_STOPPED)
+    identifier = request.sampling_params.extra_args["tokencake"]["lifecycle_id"]
+    return scheduler.connector.tokencake_scheduler.lifecycles.records[identifier]
 
 
 def start(scheduler, record):
@@ -923,6 +955,52 @@ def test_snapshot_gap_requires_reachable_ancestor(cpu_ancestor):
     else:
         counters = offload.lifecycles.metrics.snapshot(1)
         assert counters[Metric.STALE.value] == counters[Metric.PREFIX_GAP.value] == 1
+
+
+@pytest.mark.parametrize("factor", [1, 2])
+def test_mamba_recycled_state_can_be_preserved_and_reloaded(factor):
+    scheduler = make_offload_scheduler(gpu_blocks=65, groups="mamba", factor=factor)
+    original = request_for("creator", tokens=71)
+    record = complete_mamba_generation(scheduler, original)
+    offload = scheduler.connector.tokencake_scheduler
+    pool = scheduler.kv_cache_manager.block_pool
+    # The request no longer owns the aligned Mamba state, but native prefix
+    # caching can still find it. Preserve that state with the attention prefix.
+    found = pool.get_cached_block(original.block_hashes[3], [1])
+    assert found and found[0].ref_cnt == 0
+    state_id = found[0].block_id
+    assert record.snapshot.groups[1].block_ids[-1][-1] == state_id
+    free_before = pool.get_num_free_blocks()
+    scheduler.add_request(request_for("waiting", tokens=256, value=1))
+    start(scheduler, record)
+    assert offload.has_unpublished
+    assert pool.get_num_free_blocks() == free_before
+    assert state_id in offload._block_id_to_pending_jobs
+    complete_jobs(scheduler)
+    assert record.retained
+    successor = request_for("successor", tokens=80)
+    assert offload.get_num_new_matched_tokens(successor, 0) == (64, True)
+
+
+@pytest.mark.parametrize("condition", ["evicted", "in_use"])
+def test_mamba_recovered_snapshot_revalidates_state_before_store(condition):
+    scheduler = make_offload_scheduler(gpu_blocks=65, groups="mamba")
+    record = complete_mamba_generation(scheduler, request_for("creator", tokens=71))
+    offload = scheduler.connector.tokencake_scheduler
+    state_id = record.snapshot.groups[1].block_ids[-1][-1]
+    assert state_id != 0
+    pool = scheduler.kv_cache_manager.block_pool
+    if condition == "evicted":
+        pool.evict_blocks({state_id})
+    else:
+        pool.touch([pool.blocks[state_id]])
+    candidates = offload._snapshot_candidates(record)
+    assert not offload._bound_candidates(candidates, 1000)
+    if condition == "evicted":
+        assert offload.lifecycles.metrics.snapshot(0)[Metric.STALE.value] > 0
+    else:
+        pool.free_blocks([pool.blocks[state_id]])
+        assert offload._bound_candidates(offload._snapshot_candidates(record), 1000)
 
 
 @pytest.mark.parametrize("groups,expected", [(2, 3), ("hybrid", 0)])

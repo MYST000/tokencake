@@ -901,7 +901,10 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled.
                             break
 
-                if self.need_mamba_block_aligned_split:
+                # An asynchronous prefix restore schedules no model tokens.
+                # Its connector already chose a common cache boundary; align
+                # the remaining prefill only after the transfer has completed.
+                if self.need_mamba_block_aligned_split and not load_kv_async:
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,

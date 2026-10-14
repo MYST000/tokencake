@@ -38,7 +38,7 @@ from vllm.tokencake.metrics import Metric
 from vllm.tokencake.offload_policy import evaluate_benefit, waiting_pressure
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     OffloadingSpec,
@@ -91,6 +91,11 @@ class TokenCakeOffloadingScheduler(OffloadingConnectorScheduler):
             for index, group in enumerate(spec.kv_cache_config.kv_cache_groups)
             if type(group.kv_cache_spec) is FullAttentionSpec
         }
+        self._mamba_groups = {
+            index
+            for index, group in enumerate(spec.kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        }
         self.step = 0
         self._unpublished: dict[int, TransferJob] = {}
         self._detached: dict[int, DetachedStore] = {}
@@ -129,6 +134,23 @@ class TokenCakeOffloadingScheduler(OffloadingConnectorScheduler):
             hashes = request.block_hashes[
                 config.hash_block_size_factor - 1 :: config.hash_block_size_factor
             ][: computed // config.offloaded_block_size]
+            if config.group_idx in self._mamba_groups:
+                # Align mode replaces recycled request-state slots with null
+                # blocks, even while their immutable cached states still exist.
+                # Recover those states by their exact GPU-block hash. This is a
+                # read-only lookup: selection revalidates hashes/reference counts
+                # and native transfer fences protect eventual source reuse.
+                ids = list(ids)
+                hash_factor = config.hash_block_size_factor // factor
+                for index in range(min(len(ids), len(hashes) * factor)):
+                    if ids[index] != 0:
+                        continue
+                    cached = self.block_pool.get_cached_block(
+                        request.block_hashes[(index + 1) * hash_factor - 1],
+                        [config.group_idx],
+                    )
+                    if cached is not None:
+                        ids[index] = cached[0].block_id
             blocks = tuple(
                 tuple(ids[i * factor : (i + 1) * factor]) for i in range(len(hashes))
             )
