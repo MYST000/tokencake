@@ -170,7 +170,7 @@ model KV offload correctness or performance.
 
 ### Native KV load ordering fix
 
-The tag `baseline-before-kv-sync-fix-20261014` preserves the OpenHands experiment
+The tag `baseline-before-kv-sync-fix` preserves the OpenHands experiment
 version, including its local changes, before the synchronization fix. Native
 CPU-to-GPU loads now wait for preceding compute-stream work, including the
 runner's destination-block zeroing. Without this dependency, a transfer can
