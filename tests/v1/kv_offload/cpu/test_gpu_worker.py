@@ -3,12 +3,15 @@
 import random
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
@@ -18,6 +21,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.gpu_worker import CpuGpuOffloadingHandlers
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 NUM_GPU_BLOCKS = [64]
 NUM_CPU_BLOCKS = [256]
@@ -29,6 +33,89 @@ DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA _sleep")
+@pytest.mark.parametrize("use_non_default_stream", [False, True])
+@torch.inference_mode()
+def test_load_waits_for_destination_zeroing(
+    default_vllm_config, use_non_default_stream: bool
+) -> None:
+    """Pending runner zeroing must not erase an otherwise successful H2D load."""
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16
+    )
+    kv = torch.empty(
+        TritonAttentionBackend.get_kv_cache_shape(4, 16, 1, 64),
+        dtype=spec.dtype,
+        device=DEVICES[0],
+    )
+    data = kv.view(torch.int8).reshape(4, spec.page_size_bytes)
+    handlers = CpuGpuOffloadingHandlers(
+        kv_caches=CanonicalKVCaches(
+            tensors=[CanonicalKVCacheTensor(data, spec.page_size_bytes)],
+            group_data_refs=[[CanonicalKVCacheRef(0, spec.page_size_bytes)]],
+        ),
+        block_size_factor=1,
+        num_cpu_blocks=4,
+    )
+    handler = handlers.cpu_to_gpu_handler
+    handler.src_tensors[0].fill_(37)
+    zeroer = KVBlockZeroer(kv.device, pin_memory=True)
+    zeroer.init_meta(
+        attn_groups_iter=[
+            AttentionGroup(
+                backend=TritonAttentionBackend,
+                layer_names=["layer"],
+                kv_cache_spec=spec,
+                kv_cache_group_id=0,
+            )
+        ],
+        kernel_block_sizes=[spec.block_size],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context={"layer": SimpleNamespace(kv_cache=kv)},
+    )
+    transfer_spec = (
+        CPULoadStoreSpec([0]),
+        GPULoadStoreSpec([1], group_sizes=(1,), block_indices=(0,)),
+    )
+    compute_stream = (
+        torch.cuda.Stream() if use_non_default_stream else torch.cuda.current_stream()
+    )
+    try:
+        # Warm up Triton and the native copy path before introducing a delay.
+        zeroer.zero_block_ids([1])
+        torch.accelerator.synchronize()
+        assert handler.transfer_async(0, transfer_spec)
+        handler.wait({0})
+        assert len(handler.get_finished()) == 1
+
+        # Reuse the handler's pooled streams/events with different payloads.
+        for job_id in (1, 2):
+            expected = 37 + job_id
+            handler.src_tensors[0].fill_(expected)
+            data.fill_(-1)
+            torch.accelerator.synchronize()
+            with torch.cuda.stream(compute_stream):
+                torch.cuda._sleep(1_000_000_000)
+                zeroer.zero_block_ids([1])
+                assert handler.transfer_async(job_id, transfer_spec)
+
+            handler.wait({job_id})
+            compute_stream.synchronize()
+            finished = handler.get_finished()
+            assert len(finished) == 1
+            assert finished[0].job_id == job_id and finished[0].success
+            # Completion alone is insufficient: the bytes must survive zeroing.
+            torch.testing.assert_close(
+                data[1].cpu(), torch.full_like(handler.src_tensors[0][0], expected)
+            )
+            assert torch.all(data[[0, 2, 3]].cpu() == -1)
+    finally:
+        compute_stream.synchronize()
+        handlers.cpu_to_gpu_handler.shutdown()
+        handlers.gpu_to_cpu_handler.shutdown()
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])

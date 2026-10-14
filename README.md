@@ -168,6 +168,28 @@ mode. Disable FlowPilot optimizations for this control. Qwen3.5 results require
 their own validation: the Qwen2.5 measurements above do not establish hybrid
 model KV offload correctness or performance.
 
+### Native KV load ordering fix
+
+The tag `baseline-before-kv-sync-fix-20261014` preserves the OpenHands experiment
+version, including its local changes, before the synchronization fix. Native
+CPU-to-GPU loads now wait for preceding compute-stream work, including the
+runner's destination-block zeroing. Without this dependency, a transfer can
+report success even though delayed zeroing overwrites the restored KV bytes.
+GPU-to-CPU source ordering and transfer-completion tracking remain in place;
+the fix adds a stream dependency, not a device-wide synchronization.
+
+The CUDA regression uses the real `KVBlockZeroer` and native transfer handler
+on default and non-default compute streams, including pooled stream/event reuse:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m pytest \
+  tests/v1/kv_offload/cpu/test_gpu_worker.py \
+  tests/tokencake/test_offloading.py tests/tokencake/test_offloading_cuda.py -q
+```
+
+These checks validate transfer correctness. End-to-end Qwen3.5 benchmark quality
+and latency still require a separate comparison with the saved baseline.
+
 ## Repository layout
 
 | Path | Purpose |
